@@ -24,6 +24,7 @@ import json
 import logging
 import threading
 import time
+import os
 
 from bottle import static_file, route, request, HTTPResponse, run
 
@@ -551,6 +552,134 @@ def images():
         
     except Exception as e:
         logging.error(f"Error in images endpoint: {e}")
+        return HTTPResponse(status=500, body=json.dumps({'error': 'Internal server error'}))
+
+
+@route('/delete_recording', method='POST')
+def delete_recording():
+    """Delete a single recording's plot images, metadata row and optionally the raw file.
+
+    Expected JSON body: {
+        "capture_set_id": "<id>",
+        "day": "YYYY-MM-DD",
+        "plot_type": "waterfall"|"average",
+        "filename": "<filename.png>",
+        "delete_raw": true  # optional, default true
+    }
+    After deletion this endpoint will also attempt to regenerate grids for the day and trigger timeslice grid generation.
+    """
+    try:
+        postdata = request.json or {}
+        capture_set_id = postdata.get('capture_set_id')
+        day = postdata.get('day')
+        plot_type = postdata.get('plot_type')
+        filename = postdata.get('filename')
+        delete_raw = postdata.get('delete_raw', True)
+
+        if not all([capture_set_id, day, plot_type, filename]):
+            return HTTPResponse(status=400, body=json.dumps({'error': 'capture_set_id, day, plot_type and filename are required'}))
+
+        # Validate capture set id
+        all_ids = get_all_valid_capture_ids()
+        if capture_set_id not in all_ids:
+            return HTTPResponse(status=400, body=json.dumps({'error': 'invalid capture_set_id'}))
+
+        # Load metadata for the day
+        from qrm_logger.data.metadata import load_plot_metadata
+        from qrm_logger.config.output_directories import subdirectory_plots_resized, subdirectory_plots_full, subdirectory_raw, subdirectory_metadata
+        from qrm_logger.utils.util import check_file_path, create_filename_raw, create_dirname_meta
+
+        metadata = load_plot_metadata(capture_set_id, day, plot_type)
+        if not metadata or filename not in metadata:
+            return HTTPResponse(status=404, body=json.dumps({'error': 'metadata entry not found'}))
+
+        # Delete image files (resized and full)
+        deleted_files = []
+        try:
+            resized_path = check_file_path(f"{capture_set_id}/{subdirectory_plots_resized}/{day}/{filename}")
+            if os.path.exists(resized_path):
+                os.remove(resized_path)
+                deleted_files.append(str(resized_path))
+        except Exception:
+            pass
+
+        try:
+            full_path = check_file_path(f"{capture_set_id}/{subdirectory_plots_full}/{day}/{filename}")
+            if os.path.exists(full_path):
+                os.remove(full_path)
+                deleted_files.append(str(full_path))
+        except Exception:
+            pass
+
+        # Remove the metadata CSV row
+        metadata_dir = create_dirname_meta(subdirectory_metadata, capture_set_id, day, mkdirs=False)
+        metadata_file = str(metadata_dir) + "/" + plot_type + "_plots_metadata.csv"
+        try:
+            if os.path.exists(metadata_file):
+                import csv, tempfile
+                tmp_fd, tmp_path = tempfile.mkstemp()
+                with os.fdopen(tmp_fd, 'w', newline='', encoding='utf-8') as out_f:
+                    writer = None
+                    with open(metadata_file, 'r', newline='', encoding='utf-8') as in_f:
+                        reader = csv.DictReader(in_f)
+                        fieldnames = reader.fieldnames
+                        writer = csv.DictWriter(out_f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        for row in reader:
+                            if row.get('filename') == filename:
+                                continue
+                            writer.writerow(row)
+                # Replace original with filtered file
+                os.replace(tmp_path, metadata_file)
+        except Exception as e:
+            logging.error(f"Failed to update metadata file: {e}")
+
+        # Optionally delete raw file by parsing the filename for id and counter
+        raw_deleted = False
+        if delete_raw:
+            try:
+                import re
+                m = re.match(r".*/?[^-]+-[^-]+-(?P<id>[^-]+)-(?P<num>\d{4}) .*", filename)
+                if m:
+                    run_id = m.group('id')
+                    counter = m.group('num')
+                    # create_filename_raw expects integer counter
+                    raw_name = create_filename_raw(int(counter), run_id).lstrip('/')
+                    raw_path = check_file_path(f"{capture_set_id}/{subdirectory_raw}/{raw_name}")
+                    if os.path.exists(raw_path):
+                        os.remove(raw_path)
+                        raw_deleted = True
+            except Exception:
+                pass
+
+        # Regenerate grids for this day (best-effort)
+        try:
+            from qrm_logger.execution.data_exporter import process_grids, process_timeslice_grids
+            from datetime import datetime
+
+            # Regenerate daily grids
+            try:
+                process_grids(capture_set_id, day)
+            except Exception as e:
+                logging.error(f"Failed to regenerate grids for {capture_set_id} {day}: {e}")
+
+            # Attempt timeslice regeneration if configured (use current time as anchor)
+            try:
+                class _CP: pass
+                cp = _CP()
+                cp.recording_start_datetime = datetime.now()
+                process_timeslice_grids(capture_set_id, cp)
+            except Exception as e:
+                logging.error(f"Failed to trigger timeslice grid generation: {e}")
+        except Exception:
+            pass
+
+        return dict(data={
+            'deleted_files': deleted_files,
+            'raw_deleted': raw_deleted
+        })
+    except Exception as e:
+        logging.error(f"Error in delete_recording endpoint: {e}")
         return HTTPResponse(status=500, body=json.dumps({'error': 'Internal server error'}))
 
 

@@ -489,6 +489,12 @@ document.addEventListener('alpine:init', () => {
                   style="padding: 4px 12px; font-size: 12px; border: 1px solid ${this.imageSize === 'full' ? 'darkorange' : '#888'}; border-radius: 3px; cursor: pointer; background: transparent; color: ${this.imageSize === 'full' ? 'darkorange' : '#aaa'}; font-weight: normal;">
                   Full
                 </button>
+                  <button 
+                    class="pswp-delete-btn" 
+                    title="Delete this recording" 
+                    style="padding: 4px 12px; font-size: 12px; border: 1px solid #d9534f; border-radius: 3px; cursor: pointer; background: transparent; color: #f88; font-weight: normal;">
+                    Delete
+                  </button>
               </div>
             `,
             onInit: (el, pswp) => {
@@ -522,6 +528,74 @@ document.addEventListener('alpine:init', () => {
                   }
                 }, true)
               })
+
+              // Attach delete button handler
+              const deleteBtn = el.querySelector('.pswp-delete-btn')
+              if (deleteBtn) {
+                deleteBtn.addEventListener('click', async (e) => {
+                  e.stopPropagation()
+                  e.preventDefault()
+                  try {
+                    const ps = pswp
+                    const idx = typeof ps.currIndex !== 'undefined' ? ps.currIndex : (ps.getCurrentIndex ? ps.getCurrentIndex() : 0)
+                    const ds = ps.options.dataSource || []
+                    const item = ds[idx] || {}
+                    const path = item.alt || item.src || ''
+
+                    // path is expected as: {day}/{filename}
+                    let day = null
+                    let filename = path
+                    if (path && path.includes('/')) {
+                      const parts = path.split('/')
+                      day = parts[0]
+                      filename = parts.slice(1).join('/')
+                    } else {
+                      day = imageStore.selectedDay
+                    }
+
+                    const capture_set_id = Alpine.store('app').currentCaptureSetId
+                    const plot_type = Alpine.store('grid').plotType || 'waterfall'
+
+                    if (!capture_set_id || !day || !filename) {
+                      Alpine.store('app').showToast('Unable to determine recording to delete', 'error')
+                      return
+                    }
+
+                    if (!confirm('Delete this recording and its metadata? This cannot be undone.')) return
+
+                    const body = {
+                      capture_set_id: capture_set_id,
+                      day: day,
+                      plot_type: plot_type,
+                      filename: filename,
+                      delete_raw: true
+                    }
+
+                    const resp = await fetch('/delete_recording', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify(body)
+                    })
+
+                    if (!resp.ok) {
+                      const t = await resp.text()
+                      Alpine.store('app').showToast('Failed to delete recording: ' + resp.status + ' ' + t, 'error')
+                      return
+                    }
+
+                    Alpine.store('app').showToast('Recording deleted', 'success')
+
+                    // Refresh metadata and images in lightbox
+                    await imageStore.reloadImagesForCurrentDay()
+                    // Also refresh grid store so UI updates
+                    try { Alpine.store('grid').getData() } catch (e) {}
+
+                  } catch (err) {
+                    console.error('Delete failed', err)
+                    Alpine.store('app').showToast('Delete failed: ' + err.message, 'error')
+                  }
+                }, true)
+              }
             }
           })
         })
